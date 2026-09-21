@@ -1,0 +1,13 @@
+.env
+secrets/*
+!secrets/.gitkeep
+data/*
+!data/.gitkeep
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+backups/
+*.tmp
+.DS_Store

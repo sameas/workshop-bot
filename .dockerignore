@@ -1,0 +1,6 @@
+# в образ идут только bot/ и requirements.lock
+*
+!bot
+!requirements.lock
+**/__pycache__
+**/*.pyc

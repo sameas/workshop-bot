@@ -1,0 +1,20 @@
+services:
+  bot:
+    build: .
+    image: ${BOT_IMAGE:-workshop-bot:latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/bot.db
+      GOOGLE_SA_FILE: /run/secrets/google_sa
+    volumes:
+      - ./data:/data
+    secrets:
+      - google_sa
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+secrets:
+  google_sa:
+    file: ./secrets/google-sa.json
