@@ -1,4 +1,4 @@
-# generated: make lock (python:3.12-slim-bookworm), руками не править
+# make lock (python:3.12-slim-bookworm)
 aiofiles==25.1.0
 aiogram==3.31.0
 aiohappyeyeballs==2.7.1

@@ -189,7 +189,7 @@ def test_dst_duration_is_real_time():
     ("9", 540), ("2.5", 150), ("2,5", 150), ("2:30", 150), (" 1:40 ", 100), ("9 ч", 540), ("24", 1440), ("0:15", 15),
     ("2.50", 150), ("1,25", 75),
     ("0", None), ("25", None), ("abc", None), ("2:75", None), ("-3", None), ("", None), ("0:10", None),
-    # «2.30» пишут про 2 ч 30 мин, а дробью это 2 ч 18 мин: не угадываем, переспрашиваем
+    # "2.30" пишут про 2 ч 30 мин, а дробью это 2 ч 18 мин: не угадываем, переспрашиваем
     ("2.30", None), ("1.30", None), ("2,05", None), ("12,99", None),
 ])
 def test_parse_duration(text, minutes):
@@ -216,7 +216,7 @@ def test_week_agenda_shows_overnight_on_both_days(db):
     nxt = D + timedelta(days=1)
     db.create_booking(1, "A", "", ts(D, 21), ts(nxt, 6))
     db.create_booking(2, "B", "", ts(nxt, 12), ts(nxt, 14))
-    db.create_booking(3, "C", "", ts(nxt, 22), ts(nxt + timedelta(days=1), 0))   # ровно до полуночи, это не «через полночь»
+    db.create_booking(3, "C", "", ts(nxt, 22), ts(nxt + timedelta(days=1), 0))   # ровно до полуночи, это не "через полночь"
     agenda = week_agenda(db.list_active(ts(D, 0), ts(D + timedelta(days=7), 0)), D, 7, TZ)
     assert [label for label, _ in agenda[D]] == ["21:00 – Вс 04.10 06:00"]
     assert [label for label, _ in agenda[nxt]] == ["…до 06:00 (с Сб 03.10 21:00)", "12:00–14:00", "22:00–00:00"]
@@ -224,7 +224,7 @@ def test_week_agenda_shows_overnight_on_both_days(db):
     # бронь началась до окна: только продолжение под первым днём
     agenda = week_agenda(db.list_active(ts(nxt, 0), ts(nxt + timedelta(days=7), 0)), nxt, 7, TZ)
     assert agenda[nxt][0][0].startswith("…до 06:00") and D not in agenda
-    # сутки с полуночи, не «00:00–00:00»
+    # сутки с полуночи, не "00:00–00:00"
     far = D + timedelta(days=4)
     db.create_booking(4, "D", "", ts(far, 0), ts(far + timedelta(days=1), 0))
     agenda = week_agenda(db.list_active(ts(D, 0), ts(D + timedelta(days=7), 0)), D, 7, TZ)

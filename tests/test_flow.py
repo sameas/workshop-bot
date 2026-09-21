@@ -507,7 +507,7 @@ async def test_double_tap_is_silent_but_stale_button_alerts(env):
     assert last_alert(env) is None
     await env.click(MASHA, date_btn, message_id=5)  # кнопка на другом, старом сообщении
     assert "старая" in last_alert(env)
-    # двойной тап по «Забронировать»: бронь одна, алерта поверх результата нет
+    # двойной тап по "Забронировать": бронь одна, алерта поверх результата нет
     await env.click_text(MASHA, "1 ч")
     await env.click_text(MASHA, "12:00")
     await env.click_text(MASHA, "Без названия")
