@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramMigrateToChat, TelegramNetworkError, Tele
 from .config import Config
 from .db import Booking, Database
 from .gcal import CalendarUnavailable, CalEvent, GoogleCalendar, NullCalendar, describe_error, event_id_for
-from .slots import Interval, booking_intervals, fmt_booking
+from .slots import Interval, fmt_booking
 
 log = logging.getLogger(__name__)
 
@@ -124,10 +124,14 @@ class Services:
                 "(а не только «Просмотр»). Накопившиеся брони досинхронизируются сами.",
             )
 
+    async def busy_items(self, start_ts: int, end_ts: int) -> list:
+        """Брони и ручные события календаря в окне."""
+        items: list = list(self.db.list_active(start_ts, end_ts))
+        items += await self.external_events(start_ts, end_ts)
+        return items
+
     async def busy_intervals(self, start_ts: int, end_ts: int) -> list[Interval]:
-        busy = booking_intervals(self.db.list_active(start_ts, end_ts))
-        busy += [(ev.start_ts, ev.end_ts) for ev in await self.external_events(start_ts, end_ts)]
-        return busy
+        return [(i.start_ts, i.end_ts) for i in await self.busy_items(start_ts, end_ts)]
 
     # ---------- бронь / отмена ----------
 

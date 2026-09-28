@@ -394,6 +394,7 @@ async def test_allday_event_blocks_whole_day(cal_env):
     await env.click_text(MASHA, re.escape(tomorrow_label()))
     await env.click_text(MASHA, "1 ч")
     assert "Свободного времени нет" in env.session.last_text()
+    assert f"{tomorrow_label()} весь день 📌 Выходной" in env.session.last_text()  # видно, чем занят день
 
 
 # ---------- круглосуточные брони, ручная длительность ----------
@@ -953,3 +954,38 @@ async def test_mass_deletion_is_not_applied_automatically(cal_env):
     to_admin = [c.text for c in env.session.sent() if c.chat_id == ADMIN.id]
     assert len(to_admin) == 1 and "/all" in to_admin[0]
     assert [c for c in env.session.sent() if c.chat_id == GROUP.id] == []
+
+
+# ---------- экран времени объясняет, чем занят день ----------
+
+async def test_time_screen_lists_what_is_busy(cal_env):
+    env = cal_env
+    env.svc.gcal.events.append(CalEvent("manual1", _tomorrow_ts(18), _tomorrow_ts(19), "Аренда <зал>"))
+    await book(env, MASHA, "2 ч", "10:00", "Свечи")
+    await env.msg(DASHA, "/book")
+    await env.click_text(DASHA, re.escape(tomorrow_label()))
+    await env.click_text(DASHA, "1 ч")
+    text = env.session.last_text()
+    assert "Занято (+ перерыв 30 мин с обеих сторон):" in text
+    assert f"{tomorrow_label()} 10:00–12:00 Маша «Свечи»" in text
+    assert f"{tomorrow_label()} 18:00–19:00 📌 Аренда &lt;зал&gt;" in text
+    assert text.index("10:00–12:00") < text.index("18:00–19:00") < text.index("Время начала")
+    assert "12:00" not in env.session.buttons() and "12:30" in env.session.buttons()
+
+    # утренняя бронь следующего дня мешает только длинному МК, короткому её не показываем
+    nxt = _tomorrow_ts(6) + 86400
+    env.db.create_booking(MASHA.id, "Маша", "", nxt, nxt + 2 * 3600)
+    await env.click_text(DASHA, "← Назад")
+    await env.click_text(DASHA, "1 ч")
+    assert "06:00–08:00" not in env.session.last_text()
+    await env.click_text(DASHA, "← Назад")
+    await env.click_text(DASHA, "9 ч")
+    assert "06:00–08:00" in env.session.last_text()
+    assert "21:00" not in env.session.buttons() and "20:30" in env.session.buttons()
+
+    # свободный день: блока нет
+    await env.click_text(DASHA, "← Назад")
+    await env.click_text(DASHA, "← Назад")
+    await env.click_text(DASHA, re.escape(_day_label(4)))
+    await env.click_text(DASHA, "1 ч")
+    assert "Занято" not in env.session.last_text() and "Время начала" in env.session.last_text()

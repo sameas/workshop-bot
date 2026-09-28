@@ -54,6 +54,7 @@ ADMIN_HELP = (
 ADDMASTER_USAGE = "Формат: /addmaster &lt;id&gt; [имя] — или ответом на сообщение мастера"
 TITLE_MAX = 100
 LIST_MAX = 40       # броней в одном списке с кнопками отмены
+BUSY_MAX = 8        # строк "занято" над кнопками времени
 MESSAGE_MAX = 3900  # запас до лимита Telegram в 4096 символов
 
 
@@ -214,6 +215,29 @@ def booking_lines(bookings: list[Booking], cfg: Config, with_master: bool) -> li
     return lines
 
 
+def occupied_by(item) -> str:
+    """Кто занял: мастер с названием МК или ручное событие календаря."""
+    if isinstance(item, Booking):
+        title = f" «{html.quote(item.title)}»" if item.title else ""
+        return f"{html.quote(item.master_name)}{title}"
+    return f"📌 {html.quote(item.summary)} <i>(из календаря)</i>"
+
+
+def busy_block(items: list, d: date, dur: int, cfg: Config) -> str:
+    """Что мешает начать МК в день d: с учётом перерыва и того, что МК длиной dur может уйти в следующий день."""
+    buf = cfg.buffer_minutes * 60
+    lo = day_start_ts(d, cfg.tz)
+    hi = day_start_ts(d + timedelta(days=1), cfg.tz) + dur * 60
+    blocking = sorted((i for i in items if i.end_ts + buf > lo and i.start_ts - buf < hi), key=lambda i: i.start_ts)
+    if not blocking:
+        return ""
+    lines = [f"{fmt_dt_range(i.start_ts, i.end_ts, cfg.tz)} {occupied_by(i)}" for i in blocking[:BUSY_MAX]]
+    if len(blocking) > BUSY_MAX:
+        lines.append(f"…и ещё {len(blocking) - BUSY_MAX}")
+    gap = f" (+ перерыв {fmt_duration(cfg.buffer_minutes)} с обеих сторон)" if cfg.buffer_minutes else ""
+    return f"\nЗанято{gap}:\n" + "\n".join(lines) + "\n"
+
+
 async def drop_flow_keyboard(bot: Bot, chat_id: int, state: FSMContext) -> None:
     """Убирает клавиатуру с предыдущего сообщения /book."""
     msg_id = (await state.get_data()).get("flow_msg")
@@ -248,21 +272,22 @@ def calendar_down_text(e: CalendarUnavailable) -> str:
 async def times_screen(state: FSMContext, svc: Services, cfg: Config, d: date, dur: int) -> tuple[str, InlineKeyboardMarkup]:
     """Экран выбора времени, сам выставляет стейт."""
     try:
-        busy = await svc.busy_intervals(*busy_window(d, dur, cfg))
+        items = await svc.busy_items(*busy_window(d, dur, cfg))
     except CalendarUnavailable as e:
         await state.set_state(BookFlow.duration)
         return calendar_down_text(e), kb_durations(cfg)
-    times = free_start_times(d, dur, busy, cfg)
+    times = free_start_times(d, dur, [(i.start_ts, i.end_ts) for i in items], cfg)
     header = f"Дата: <b>{fmt_date(d)}</b>, {fmt_duration(dur)}\n"
     if not times and not has_future_starts(d, cfg):
         await state.set_state(BookFlow.date)
         return (f"На {fmt_date(d)} время уже вышло. Часы после полуночи — это уже следующая дата.\nВыбери дату:",
                 kb_dates(cfg))
+    busy = busy_block(items, d, dur, cfg)
     if not times:
         await state.set_state(BookFlow.duration)
-        return header + "Свободного времени нет. Другая длительность или ← Назад к дате.", kb_durations(cfg)
+        return header + busy + "\nСвободного времени нет. Другая длительность или ← Назад к дате.", kb_durations(cfg)
     await state.set_state(BookFlow.time)
-    return header + "Время начала:", kb_times(times, cfg)
+    return header + busy + "\nВремя начала:", kb_times(times, cfg)
 
 
 def duration_prompt(d: date) -> str:
@@ -418,11 +443,7 @@ def build_routers() -> tuple[Router, ...]:
         for d, day_items in agenda.items():
             lines.append(f"\n<b>{fmt_date(d)}</b>")
             for label, item in day_items:
-                if isinstance(item, Booking):
-                    title = f" «{html.quote(item.title)}»" if item.title else ""
-                    lines.append(f"{label} {html.quote(item.master_name)}{title}")
-                else:
-                    lines.append(f"{label} 📌 {html.quote(item.summary)} <i>(из календаря)</i>")
+                lines.append(f"{label} {occupied_by(item)}")
         if note:
             lines.append(note)
         await answer_long(m, lines)
