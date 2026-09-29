@@ -966,9 +966,9 @@ async def test_time_screen_lists_what_is_busy(cal_env):
     await env.click_text(DASHA, re.escape(tomorrow_label()))
     await env.click_text(DASHA, "1 ч")
     text = env.session.last_text()
-    assert "Занято (+ перерыв 30 мин с обеих сторон):" in text
-    assert f"{tomorrow_label()} 10:00–12:00 Маша «Свечи»" in text
-    assert f"{tomorrow_label()} 18:00–19:00 📌 Аренда &lt;зал&gt;" in text
+    assert "<u>Занято, между МК перерыв 30 мин</u>" in text
+    assert f"• {tomorrow_label()} 10:00–12:00 Маша «Свечи»" in text
+    assert f"• {tomorrow_label()} 18:00–19:00 📌 Аренда &lt;зал&gt;" in text
     assert text.index("10:00–12:00") < text.index("18:00–19:00") < text.index("Время начала")
     assert "12:00" not in env.session.buttons() and "12:30" in env.session.buttons()
 

@@ -231,11 +231,11 @@ def busy_block(items: list, d: date, dur: int, cfg: Config) -> str:
     blocking = sorted((i for i in items if i.end_ts + buf > lo and i.start_ts - buf < hi), key=lambda i: i.start_ts)
     if not blocking:
         return ""
-    lines = [f"{fmt_dt_range(i.start_ts, i.end_ts, cfg.tz)} {occupied_by(i)}" for i in blocking[:BUSY_MAX]]
+    lines = [f"• {fmt_dt_range(i.start_ts, i.end_ts, cfg.tz)} {occupied_by(i)}" for i in blocking[:BUSY_MAX]]
     if len(blocking) > BUSY_MAX:
         lines.append(f"…и ещё {len(blocking) - BUSY_MAX}")
-    gap = f" (+ перерыв {fmt_duration(cfg.buffer_minutes)} с обеих сторон)" if cfg.buffer_minutes else ""
-    return f"\nЗанято{gap}:\n" + "\n".join(lines) + "\n"
+    gap = f", между МК перерыв {fmt_duration(cfg.buffer_minutes)}" if cfg.buffer_minutes else ""
+    return f"\n<u>Занято{gap}</u>\n" + "\n".join(lines) + "\n"
 
 
 async def drop_flow_keyboard(bot: Bot, chat_id: int, state: FSMContext) -> None:
