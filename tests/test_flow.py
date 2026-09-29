@@ -876,14 +876,34 @@ async def test_week_shows_manual_calendar_events(cal_env):
     await book(env, MASHA, "2 ч", "10:00", "Свечи")
     await env.msg(DASHA, "/week")
     text = env.session.last_text()
-    assert "10:00–12:00 Маша «Свечи»" in text
-    assert "18:00–19:00 📌 Аренда &lt;зал&gt;" in text and "весь день 📌 Выходной" in text
+    assert text.startswith("<u>Занятость на неделю</u>")
+    assert f'• 10:00–12:00 <a href="tg://user?id={MASHA.id}">Маша</a> «Свечи»' in text
+    assert "• 18:00–19:00 📌 Аренда &lt;зал&gt;" in text and "• весь день 📌 Выходной" in text
     assert text.index("10:00–12:00") < text.index("18:00–19:00")
     assert text.count("10:00–12:00") == 1  # своё событие бота не дублирует бронь
 
     env.svc.gcal.down = True
     await env.msg(DASHA, "/week")
-    assert "10:00–12:00 Маша" in env.session.last_text() and "получить не удалось" in env.session.last_text()
+    assert "• 10:00–12:00 <a" in env.session.last_text() and "получить не удалось" in env.session.last_text()
+
+
+async def test_all_shows_same_as_week_with_cancel_buttons(cal_env):
+    env = cal_env
+    env.svc.gcal.events.append(CalEvent("manual1", _tomorrow_ts(18), _tomorrow_ts(19), "Аренда"))
+    await book(env, MASHA, "2 ч", "10:00", "Свечи")
+    b = env.db.list_active(0, 2**40)[0]
+    await env.msg(ADMIN, "/all")
+    text = env.session.last_text()
+    assert text.startswith("<u>Занятость до ")
+    assert f'• #{b.id} 10:00–12:00 <a href="tg://user?id={MASHA.id}">Маша</a> «Свечи»' in text
+    assert "• 18:00–19:00 📌 Аренда" in text
+    assert list(env.session.buttons()) == [f"Отменить #{b.id}"]  # событие календаря отменить нельзя
+    await env.msg(DASHA, "/week")
+    assert "• 18:00–19:00 📌 Аренда" in env.session.last_text()
+    await env.svc.cancel(b.id, "Маша", by_id=MASHA.id)
+    env.svc.gcal.events.clear()
+    await env.msg(ADMIN, "/all")
+    assert env.session.last_text() == "Всё свободно, броней нет"
 
 
 async def test_week_with_only_manual_events(cal_env):
@@ -967,7 +987,7 @@ async def test_time_screen_lists_what_is_busy(cal_env):
     await env.click_text(DASHA, "1 ч")
     text = env.session.last_text()
     assert "<u>Занято, между МК перерыв 30 мин</u>" in text
-    assert f"• {tomorrow_label()} 10:00–12:00 Маша «Свечи»" in text
+    assert f'• {tomorrow_label()} 10:00–12:00 <a href="tg://user?id={MASHA.id}">Маша</a> «Свечи»' in text
     assert f"• {tomorrow_label()} 18:00–19:00 📌 Аренда &lt;зал&gt;" in text
     assert text.index("10:00–12:00") < text.index("18:00–19:00") < text.index("Время начала")
     assert "12:00" not in env.session.buttons() and "12:30" in env.session.buttons()

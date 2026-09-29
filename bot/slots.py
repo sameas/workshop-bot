@@ -110,12 +110,19 @@ def fmt_slot(start_ts: int, end_ts: int, tz: ZoneInfo) -> str:
     return f"{fmt_dt_range(start_ts, end_ts, tz)} ({fmt_duration((end_ts - start_ts) // 60)})"
 
 
+def master_link(b: Booking) -> str:
+    """Имя мастера ссылкой на его профиль."""
+    from aiogram import html
+
+    return f'<a href="tg://user?id={b.master_tg_id}">{html.quote(b.master_name)}</a>'
+
+
 def fmt_booking(b: Booking, tz: ZoneInfo, with_master: bool = True) -> str:
     from aiogram import html  # локально, чтобы тесты слотов не тянули aiogram
 
     parts = [fmt_dt_range(b.start_ts, b.end_ts, tz)]
     if with_master:
-        parts.append(html.quote(b.master_name))
+        parts.append(master_link(b))
     if b.title:
         parts.append(f"«{html.quote(b.title)}»")
     return " — ".join(parts)

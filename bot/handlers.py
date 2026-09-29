@@ -29,6 +29,7 @@ from .slots import (
     fmt_slot,
     free_start_times,
     has_future_starts,
+    master_link,
     parse_duration,
     week_agenda,
 )
@@ -49,7 +50,7 @@ ADMIN_HELP = (
     "/addmaster &lt;id&gt; [имя] — добавить мастера (или ответом на его сообщение)\n"
     "/delmaster &lt;id&gt; — убрать\n"
     "/masters — список: имя, @тег, ID\n"
-    "/all — все брони (и отмена любой)"
+    "/all — занятость на весь срок бронирования, отмена любой брони"
 )
 ADDMASTER_USAGE = "Формат: /addmaster &lt;id&gt; [имя] — или ответом на сообщение мастера"
 TITLE_MAX = 100
@@ -209,7 +210,7 @@ async def answer_long(m: Message, lines: list[str], reply_markup: InlineKeyboard
 
 
 def booking_lines(bookings: list[Booking], cfg: Config, with_master: bool) -> list[str]:
-    lines = [f"#{b.id} {fmt_booking(b, cfg.tz, with_master=with_master)}" for b in bookings[:LIST_MAX]]
+    lines = [f"• #{b.id} {fmt_booking(b, cfg.tz, with_master=with_master)}" for b in bookings[:LIST_MAX]]
     if len(bookings) > LIST_MAX:
         lines.append(f"…и ещё {len(bookings) - LIST_MAX}")
     return lines
@@ -219,7 +220,7 @@ def occupied_by(item) -> str:
     """Кто занял: мастер с названием МК или ручное событие календаря."""
     if isinstance(item, Booking):
         title = f" «{html.quote(item.title)}»" if item.title else ""
-        return f"{html.quote(item.master_name)}{title}"
+        return f"{master_link(item)}{title}"
     return f"📌 {html.quote(item.summary)} <i>(из календаря)</i>"
 
 
@@ -236,6 +237,30 @@ def busy_block(items: list, d: date, dur: int, cfg: Config) -> str:
         lines.append(f"…и ещё {len(blocking) - BUSY_MAX}")
     gap = f", между МК перерыв {fmt_duration(cfg.buffer_minutes)}" if cfg.buffer_minutes else ""
     return f"\n<u>Занято{gap}</u>\n" + "\n".join(lines) + "\n"
+
+
+async def occupancy(svc: Services, cfg: Config, last: date) -> tuple[list, list[Booking], str]:
+    """Брони и события календаря с текущего момента по конец дня last: (всё, только брони, note про календарь)."""
+    start, end = int(time.time()), day_start_ts(last + timedelta(days=1), cfg.tz)
+    bookings = svc.db.list_active(start, end)
+    items: list = list(bookings)
+    note = ""
+    try:
+        items += await svc.external_events(start, end)
+    except CalendarUnavailable:
+        note = "\n⚠️ События из Google Calendar получить не удалось — показаны только брони."
+    return items, bookings, note
+
+
+def agenda_lines(items: list, first: date, last: date, cfg: Config, with_ids: bool) -> list[str]:
+    """Занятость по дням; with_ids — номера броней, когда под списком кнопки отмены."""
+    lines: list[str] = []
+    for d, day_items in week_agenda(items, first, (last - first).days + 1, cfg.tz).items():
+        lines.append(f"\n<b>{fmt_date(d)}</b>")
+        for label, item in day_items:
+            num = f"#{item.id} " if with_ids and isinstance(item, Booking) else ""
+            lines.append(f"• {num}{label} {occupied_by(item)}")
+    return lines
 
 
 async def drop_flow_keyboard(bot: Bot, chat_id: int, state: FSMContext) -> None:
@@ -409,15 +434,22 @@ def build_routers() -> tuple[Router, ...]:
         ])
 
     @admin.message(Command("all"))
-    async def cmd_all(m: Message, db: Database, cfg: Config) -> None:
+    async def cmd_all(m: Message, db: Database, cfg: Config, svc: Services) -> None:
         if m.chat.type != ChatType.PRIVATE:
             await m.answer("Эта команда — в личке")
             return
-        bookings = db.list_active(int(time.time()), 2**40)
-        if not bookings:
-            await m.answer("Активных броней нет")
+        today = datetime.now(cfg.tz).date()
+        last = today + timedelta(days=cfg.days_ahead)
+        future = db.list_active(int(time.time()), 2**40)
+        if future:  # брони дальше горизонта (DAYS_AHEAD уменьшили) тоже показываем
+            last = max(last, datetime.fromtimestamp(max(b.end_ts for b in future), cfg.tz).date())
+        items, bookings, note = await occupancy(svc, cfg, last)
+        lines = agenda_lines(items, today, last, cfg, with_ids=True)
+        if not lines:
+            await m.answer("Всё свободно, броней нет" + note)
             return
-        await answer_long(m, ["Все брони:"] + booking_lines(bookings, cfg, with_master=True), reply_markup=kb_my(bookings))
+        await answer_long(m, [f"<u>Занятость до {fmt_date(last)}</u>"] + lines + ([note] if note else []),
+                          reply_markup=kb_my(bookings))
 
     # ---------- мастера ----------
 
@@ -426,27 +458,15 @@ def build_routers() -> tuple[Router, ...]:
     master.callback_query.filter(MasterFilter())
 
     @master.message(Command("week"))
-    async def cmd_week(m: Message, db: Database, cfg: Config, svc: Services) -> None:
+    async def cmd_week(m: Message, cfg: Config, svc: Services) -> None:
         today = datetime.now(cfg.tz).date()
-        start, end = day_start_ts(today, cfg.tz), day_start_ts(today + timedelta(days=7), cfg.tz)
-        items: list = db.list_active(start, end)
-        note = ""
-        try:
-            items += await svc.external_events(start, end)
-        except CalendarUnavailable:
-            note = "\n\n⚠️ События из Google Calendar получить не удалось — показаны только брони."
-        agenda = week_agenda(items, today, 7, cfg.tz)
-        if not agenda:
-            await m.answer("На ближайшую неделю броней нет" + note)
+        last = today + timedelta(days=6)
+        items, _, note = await occupancy(svc, cfg, last)
+        lines = agenda_lines(items, today, last, cfg, with_ids=False)
+        if not lines:
+            await m.answer("На неделю вперёд всё свободно" + note)
             return
-        lines = ["Занятость на неделю:"]
-        for d, day_items in agenda.items():
-            lines.append(f"\n<b>{fmt_date(d)}</b>")
-            for label, item in day_items:
-                lines.append(f"{label} {occupied_by(item)}")
-        if note:
-            lines.append(note)
-        await answer_long(m, lines)
+        await answer_long(m, ["<u>Занятость на неделю</u>"] + lines + ([note] if note else []))
 
     @master.message(Command("my"))
     async def cmd_my(m: Message, db: Database, cfg: Config) -> None:
@@ -454,7 +474,8 @@ def build_routers() -> tuple[Router, ...]:
         if not bookings:
             await m.answer("У тебя нет активных броней")
             return
-        await answer_long(m, ["Твои брони:"] + booking_lines(bookings, cfg, with_master=False), reply_markup=kb_my(bookings))
+        await answer_long(m, ["<u>Твои брони</u>"] + booking_lines(bookings, cfg, with_master=False),
+                          reply_markup=kb_my(bookings))
 
     def _may_cancel(b: Booking, user: User, cfg: Config) -> bool:
         return b.master_tg_id == user.id or is_admin(user, cfg)
