@@ -15,9 +15,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .config import MAX_DURATION_MINUTES, MIN_DURATION_MINUTES, Config
-from .db import Booking, ConflictError, Database
-from .gcal import CalendarUnavailable
+from .config import MAX_DURATION_MINUTES, MIN_DURATION_MINUTES, TITLE_MAX, Config
+from .db import Booking, ConflictError, Database, Master
+from .gcal import CalendarUnavailable, CalEvent
 from .services import CalendarConflict, Services, SlotInPast
 from .slots import (
     busy_window,
@@ -33,6 +33,7 @@ from .slots import (
     parse_duration,
     week_agenda,
 )
+from .tasks import QUIET_HOURS
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ HELP = (
     "Бронирование мастерской под мастер-классы. Бронировать можно на любое время суток, "
     "МК может идти через полночь.\n\n"
     "/book — забронировать\n"
-    "/my — мои брони (и отмена)\n"
+    "/my — мои брони: отмена, передача другому мастеру\n"
     "/week — занятость на неделю\n"
     "/cancel — прервать бронирование\n"
     "/id — мой Telegram ID"
@@ -50,11 +51,11 @@ ADMIN_HELP = (
     "/addmaster &lt;id&gt; [имя] — добавить мастера (или ответом на его сообщение)\n"
     "/delmaster &lt;id&gt; — убрать\n"
     "/masters — список: имя, @тег, ID\n"
-    "/all — занятость на весь срок бронирования, отмена любой брони"
+    "/all — занятость на весь срок бронирования: отмена любой брони, назначить мастера на событие из календаря\n"
+    "/manual — инструкция для мастеров, переслать в чат"
 )
 ADDMASTER_USAGE = "Формат: /addmaster &lt;id&gt; [имя] — или ответом на сообщение мастера"
-TITLE_MAX = 100
-LIST_MAX = 40       # броней в одном списке с кнопками отмены
+LIST_MAX = 30       # броней в одном списке: по две кнопки на каждую, лимит Telegram 100
 BUSY_MAX = 8        # строк "занято" над кнопками времени
 MESSAGE_MAX = 3900  # запас до лимита Telegram в 4096 символов
 
@@ -95,6 +96,16 @@ class BookCb(CallbackData, prefix="bk"):
 class CancelCb(CallbackData, prefix="cn"):
     booking_id: int
     action: str = "ask"   # ask | do | keep; "0"/"1" приходят со старых кнопок
+
+
+class TransferCb(CallbackData, prefix="tr"):
+    booking_id: int
+    to: int = 0           # 0: показать список мастеров, -1: не передавать, иначе tg_id получателя
+
+
+class AdoptCb(CallbackData, prefix="ad"):
+    key: str              # CalEvent.key
+    to: int = 0           # как в TransferCb
 
 
 class BookFlow(StatesGroup):
@@ -168,11 +179,22 @@ def kb_confirm() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def kb_my(bookings: list[Booking]) -> InlineKeyboardMarkup:
+def kb_my(bookings: list[Booking], events: list[CalEvent] | None = None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for bk in bookings[:LIST_MAX]:
-        b.button(text=f"Отменить #{bk.id}", callback_data=CancelCb(booking_id=bk.id))
+        b.row(_btn(f"Отменить #{bk.id}", CancelCb(booking_id=bk.id)), _btn(f"Передать #{bk.id}", TransferCb(booking_id=bk.id)))
+    for ev in (events or [])[:LIST_MAX]:
+        b.row(_btn(f"Назначить мастера: {ev.summary[:24]}", AdoptCb(key=ev.key)))
+    return b.as_markup()
+
+
+def kb_masters(masters: list[Master], pick, close: CallbackData, close_text: str) -> InlineKeyboardMarkup:
+    """pick(tg_id) -> callback data кнопки мастера."""
+    b = InlineKeyboardBuilder()
+    for x in masters:
+        b.button(text=x.name, callback_data=pick(x.tg_id))
     b.adjust(2)
+    b.row(_btn(close_text, close))
     return b.as_markup()
 
 
@@ -261,6 +283,56 @@ def agenda_lines(items: list, first: date, last: date, cfg: Config, with_ids: bo
             num = f"#{item.id} " if with_ids and isinstance(item, Booking) else ""
             lines.append(f"• {num}{label} {occupied_by(item)}")
     return lines
+
+
+def all_horizon(db: Database, cfg: Config) -> date:
+    """Последний день для /all: срок бронирования, но не раньше конца самой дальней брони (DAYS_AHEAD могли уменьшить)."""
+    today = datetime.now(cfg.tz).date()
+    last = today + timedelta(days=cfg.days_ahead)
+    future = db.list_active(int(time.time()), 2**40)
+    if future:
+        last = max(last, datetime.fromtimestamp(max(b.end_ts for b in future), cfg.tz).date())
+    return last
+
+
+def manual_text(cfg: Config) -> list[str]:
+    """Инструкция для мастеров; админ шлёт её в чат через /manual."""
+    reminders = [fmt_duration(m) for m in cfg.remind_before_minutes]
+    gap = (f" Между мастер-классами нужен перерыв {fmt_duration(cfg.buffer_minutes)}, поэтому сразу после чужой брони "
+           "начать нельзя.") if cfg.buffer_minutes else ""
+    quiet = f"с {QUIET_HOURS[0]:02d}:00 до {QUIET_HOURS[1]:02d}:00"
+    return [
+        "<b>Как бронировать мастерскую</b>",
+        "",
+        "Всё делается в личке с ботом. Если он отвечает «доступ только для мастеров», отправь админу свой ID: "
+        "бот показывает его на /start.",
+        "",
+        "<b>Забронировать: /book</b>",
+        f"1. Дата, на {cfg.days_ahead} дн. вперёд. Это дата начала: МК, который начинается в 00:30 в ночь с субботы "
+        "на воскресенье, бронируется на воскресенье.",
+        f"2. Длительность: кнопкой или текстом («9», «2,5», «2:30» — это часы), до {fmt_duration(MAX_DURATION_MINUTES)}. "
+        "МК может идти через полночь.",
+        f"3. Время начала. Над кнопками список «Занято»: чужие брони и события из общего календаря.{gap}",
+        "4. Название: текстом или кнопка «Без названия». Пока не нажал «Забронировать», можно отправить другое.",
+        "5. «✅ Забронировать». В чат мастеров придёт анонс.",
+        "",
+        "Передумал по дороге: «← Назад», «✖ Отмена» или /cancel.",
+        "",
+        "<b>Мои брони: /my</b>",
+        "«Отменить» — отменить, с подтверждением. «Передать» — отдать бронь другому мастеру: он получит сообщение, "
+        "напоминания пойдут ему. Изменить время нельзя: отмени и забронируй заново.",
+        "",
+        "<b>Кто когда: /week</b>",
+        "Занятость на неделю: брони мастеров и события из общего календаря (📌). Имя мастера — ссылка, можно сразу написать.",
+        "",
+        "<b>Напоминания</b>",
+        (f"За {' и за '.join(reminders)} до начала, в личку и в чат мастеров (в чат {quiet} без звука). "
+         "Чтобы приходили в личку, один раз нажми /start у бота.") if reminders else "Напоминаний нет.",
+        "",
+        "<b>Google Calendar</b>",
+        "Брони попадают в общий календарь сами. Не удаляй там событие бота: он это заметит и отменит бронь. "
+        "Перенос события бот не видит, менять время нужно через отмену и новую бронь.",
+    ]
 
 
 async def drop_flow_keyboard(bot: Bot, chat_id: int, state: FSMContext) -> None:
@@ -371,6 +443,7 @@ def build_routers() -> tuple[Router, ...]:
 
     admin = Router(name="admin")
     admin.message.filter(AdminFilter())
+    admin.callback_query.filter(AdminFilter())
 
     @admin.message(Command("addmaster"))
     async def cmd_addmaster(m: Message, command: CommandObject, db: Database) -> None:
@@ -439,17 +512,67 @@ def build_routers() -> tuple[Router, ...]:
             await m.answer("Эта команда — в личке")
             return
         today = datetime.now(cfg.tz).date()
-        last = today + timedelta(days=cfg.days_ahead)
-        future = db.list_active(int(time.time()), 2**40)
-        if future:  # брони дальше горизонта (DAYS_AHEAD уменьшили) тоже показываем
-            last = max(last, datetime.fromtimestamp(max(b.end_ts for b in future), cfg.tz).date())
+        last = all_horizon(db, cfg)
         items, bookings, note = await occupancy(svc, cfg, last)
         lines = agenda_lines(items, today, last, cfg, with_ids=True)
         if not lines:
             await m.answer("Всё свободно, броней нет" + note)
             return
+        events = [i for i in items if isinstance(i, CalEvent)]
         await answer_long(m, [f"<u>Занятость до {fmt_date(last)}</u>"] + lines + ([note] if note else []),
-                          reply_markup=kb_my(bookings))
+                          reply_markup=kb_my(bookings, events))
+
+    @admin.message(Command("manual"))
+    async def cmd_manual(m: Message, cfg: Config) -> None:
+        await answer_long(m, manual_text(cfg))
+
+    # --- событие из календаря -> бронь мастера ---
+
+    async def find_event(svc: Services, db: Database, cfg: Config, key: str) -> CalEvent | None:
+        items, _, _ = await occupancy(svc, cfg, all_horizon(db, cfg))
+        return next((i for i in items if isinstance(i, CalEvent) and i.key == key), None)
+
+    @admin.callback_query(AdoptCb.filter(F.to == 0))
+    async def cb_adopt_ask(cq: CallbackQuery, callback_data: AdoptCb, db: Database, cfg: Config, svc: Services) -> None:
+        ev = await find_event(svc, db, cfg, callback_data.key)
+        if ev is None:
+            await cq.answer("Событие не найдено, открой /all заново", show_alert=True)
+            return
+        masters = db.list_masters()
+        if not masters:
+            await cq.answer("Мастеров пока нет", show_alert=True)
+            return
+        await safe_edit(
+            cq, f"Кого назначить на «{html.quote(ev.summary)}»?\n{fmt_dt_range(ev.start_ts, ev.end_ts, cfg.tz)}",
+            kb_masters(masters, lambda tg_id: AdoptCb(key=ev.key, to=tg_id), AdoptCb(key=ev.key, to=-1), "Не назначать"),
+        )
+        await cq.answer()
+
+    @admin.callback_query(AdoptCb.filter(F.to == -1))
+    async def cb_adopt_keep(cq: CallbackQuery) -> None:
+        await safe_edit(cq, "Ок, событие остаётся как есть")
+        await cq.answer()
+
+    @admin.callback_query(AdoptCb.filter(F.to > 0))
+    async def cb_adopt_do(cq: CallbackQuery, callback_data: AdoptCb, db: Database, cfg: Config, svc: Services) -> None:
+        ev = await find_event(svc, db, cfg, callback_data.key)
+        to = db.get_master(callback_data.to)
+        if ev is None or to is None:
+            await cq.answer("Событие или мастер уже не найдены, открой /all заново", show_alert=True)
+            return
+        try:
+            b = await svc.adopt_event(ev, to, display_name(cq.from_user, db))
+        except ConflictError as e:
+            lines = "\n".join(fmt_booking(c, cfg.tz) for c in e.conflicts)
+            await safe_edit(cq, f"⚠️ Не получилось: событие пересекается с бронью\n{lines}")
+            await cq.answer()
+            return
+        except ValueError:
+            await safe_edit(cq, "⚠️ Событие длиннее суток, бронью его не сделать")
+            await cq.answer()
+            return
+        await cq.answer("Мастер назначен")
+        await safe_edit(cq, f"📅 Назначено\n{fmt_booking(b, cfg.tz)}")
 
     # ---------- мастера ----------
 
@@ -512,6 +635,50 @@ def build_routers() -> tuple[Router, ...]:
             await safe_edit(cq, f"Бронь уже была отменена\n{fmt_booking(b, cfg.tz)}")
         else:
             await safe_edit(cq, f"❌ Бронь отменена\n{fmt_booking(cancelled, cfg.tz)}")
+
+    # --- передача брони другому мастеру ---
+
+    @master.callback_query(TransferCb.filter(F.to == 0))
+    async def cb_transfer_ask(cq: CallbackQuery, callback_data: TransferCb, db: Database, cfg: Config) -> None:
+        b = db.get_booking(callback_data.booking_id)
+        if not b or not b.active:
+            await cq.answer("Бронь уже неактивна", show_alert=True)
+            return
+        if not _may_cancel(b, cq.from_user, cfg):
+            await cq.answer("Это не твоя бронь", show_alert=True)
+            return
+        others = [x for x in db.list_masters() if x.tg_id != b.master_tg_id]
+        if not others:
+            await cq.answer("Передавать некому: других мастеров нет", show_alert=True)
+            return
+        await safe_edit(
+            cq, f"Кому передать бронь?\n{fmt_booking(b, cfg.tz)}",
+            kb_masters(others, lambda tg_id: TransferCb(booking_id=b.id, to=tg_id), TransferCb(booking_id=b.id, to=-1),
+                       "Не передавать"),
+        )
+        await cq.answer()
+
+    @master.callback_query(TransferCb.filter(F.to == -1))
+    async def cb_transfer_keep(cq: CallbackQuery, callback_data: TransferCb, db: Database, cfg: Config) -> None:
+        b = db.get_booking(callback_data.booking_id)
+        kept = f"\n{fmt_booking(b, cfg.tz)}" if b and b.active else ""
+        await safe_edit(cq, f"Ок, бронь остаётся{kept}")
+        await cq.answer()
+
+    @master.callback_query(TransferCb.filter(F.to > 0))
+    async def cb_transfer_do(cq: CallbackQuery, callback_data: TransferCb, db: Database, cfg: Config, svc: Services) -> None:
+        b = db.get_booking(callback_data.booking_id)
+        if not b or not b.active or not _may_cancel(b, cq.from_user, cfg):
+            await cq.answer("Нельзя", show_alert=True)
+            return
+        to = db.get_master(callback_data.to)
+        if to is None:
+            await cq.answer("Этого мастера уже нет в списке", show_alert=True)
+            return
+        new = await svc.transfer(b.id, to, display_name(cq.from_user, db), cq.from_user.id)
+        await cq.answer("Бронь передана" if new else "Не получилось")
+        if new:
+            await safe_edit(cq, f"🔁 Бронь передана\n{fmt_booking(new, cfg.tz)}")
 
     # --- /book: дата -> длительность -> время -> название -> подтверждение ---
 

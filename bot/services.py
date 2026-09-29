@@ -6,10 +6,10 @@ import time
 from aiogram import Bot, html
 from aiogram.exceptions import TelegramMigrateToChat, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 
-from .config import Config
-from .db import Booking, Database
-from .gcal import CalendarUnavailable, CalEvent, GoogleCalendar, NullCalendar, describe_error, event_id_for
-from .slots import Interval, fmt_booking
+from .config import MAX_DURATION_MINUTES, TITLE_MAX, Config
+from .db import Booking, Database, Master
+from .gcal import NO_TITLE, CalendarUnavailable, CalEvent, GoogleCalendar, NullCalendar, describe_error, event_id_for
+from .slots import Interval, fmt_booking, master_link
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +166,48 @@ class Services:
         await self.remove_from_calendar(booking)
         return booking
 
+    async def transfer(self, booking_id: int, to: Master, by_name: str, by_id: int) -> Booking | None:
+        """Передаёт активную бронь другому мастеру; None, если бронь неактивна или уже у него."""
+        old = self.db.get_booking(booking_id)
+        if old is None or not old.active or old.master_tg_id == to.tg_id:
+            return None
+        self.db.set_master(old.id, to.tg_id, to.name)
+        new = self.db.get_booking(old.id)
+        by = "" if by_id == old.master_tg_id else f" ({html.quote(by_name)})"
+        details = fmt_booking(new, self.cfg.tz, with_master=False)
+        await self.announce(f"🔁 Бронь передана: {master_link(old)} → {master_link(new)}{by}\n{details}")
+        await self.tell_user(to.tg_id, f"🔁 Тебе передали бронь\n{details}\n\nОтменить или передать дальше — через /my")
+        if by_id != old.master_tg_id:
+            await self.tell_user(
+                old.master_tg_id, f"🔁 {html.quote(by_name)} передал(а) твою бронь: {master_link(new)}\n{details}"
+            )
+        await self.refresh_calendar(new)
+        return new
+
+    async def adopt_event(self, ev: CalEvent, to: Master, by_name: str) -> Booking:
+        """Ручное событие календаря становится бронью мастера. Бросает ConflictError и ValueError (длиннее суток)."""
+        if ev.end_ts - ev.start_ts > MAX_DURATION_MINUTES * 60:
+            raise ValueError("event longer than a day")
+        title = "" if ev.summary == NO_TITLE else ev.summary[:TITLE_MAX]
+        created = self.db.create_booking(to.tg_id, to.name, title, ev.start_ts, ev.end_ts)
+        self.db.set_gcal_event(created.id, ev.id)  # событие остаётся, теперь оно зеркало этой брони
+        b = self.db.get_booking(created.id) or created
+        details = fmt_booking(b, self.cfg.tz, with_master=False)
+        await self.announce(f"📅 {html.quote(by_name)} назначил(а) мастера на МК из календаря: {master_link(b)}\n{details}")
+        await self.tell_user(to.tg_id, f"📅 На тебя записан мастер-класс\n{details}\n\nОтменить или передать — через /my")
+        await self.refresh_calendar(b)
+        return b
+
     # ---------- зеркало в календаре ----------
+
+    async def refresh_calendar(self, b: Booking) -> None:
+        """Название события после смены мастера; при сбое зеркало просто отстаёт по имени."""
+        if not self.gcal.enabled or not b.gcal_event_id:
+            return
+        try:
+            await self.gcal.update_event(b.gcal_event_id, b)
+        except Exception as e:
+            log.warning("Google Calendar: не удалось обновить событие брони #%s: %s", b.id, describe_error(e)[0])
 
     async def sync_to_calendar(self, booking: Booking) -> bool:
         if not self.gcal.enabled or booking.gcal_event_id:

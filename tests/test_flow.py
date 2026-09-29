@@ -30,7 +30,7 @@ from googleapiclient.errors import HttpError
 from bot import handlers, tasks
 from bot.db import Database
 from bot.gcal import CalEvent, NullCalendar, event_id_for
-from bot.handlers import BookCb, CancelCb
+from bot.handlers import AdoptCb, BookCb, CancelCb, TransferCb
 from bot.main import build_dispatcher
 from bot.services import MAX_DELETIONS_PER_PASS, Services
 from bot.slots import fmt_date
@@ -309,6 +309,11 @@ class FakeCalendar:
 
     async def delete_event(self, event_id):
         self.events = [e for e in self.events if e.id != event_id]
+
+    async def update_event(self, event_id, booking):
+        title = f"МК: {booking.title}" if booking.title else "Мастер-класс"
+        self.events = [CalEvent(e.id, e.start_ts, e.end_ts, f"{title} — {booking.master_name}") if e.id == event_id else e
+                       for e in self.events]
 
     def manual_delete(self, event_id):
         """Удаление руками: Google ещё помнит событие как удалённое."""
@@ -897,7 +902,7 @@ async def test_all_shows_same_as_week_with_cancel_buttons(cal_env):
     assert text.startswith("<u>Занятость до ")
     assert f'• #{b.id} 10:00–12:00 <a href="tg://user?id={MASHA.id}">Маша</a> «Свечи»' in text
     assert "• 18:00–19:00 📌 Аренда" in text
-    assert list(env.session.buttons()) == [f"Отменить #{b.id}"]  # событие календаря отменить нельзя
+    assert list(env.session.buttons()) == [f"Отменить #{b.id}", f"Передать #{b.id}", "Назначить мастера: Аренда"]
     await env.msg(DASHA, "/week")
     assert "• 18:00–19:00 📌 Аренда" in env.session.last_text()
     await env.svc.cancel(b.id, "Маша", by_id=MASHA.id)
@@ -1009,3 +1014,108 @@ async def test_time_screen_lists_what_is_busy(cal_env):
     await env.click_text(DASHA, re.escape(_day_label(4)))
     await env.click_text(DASHA, "1 ч")
     assert "Занято" not in env.session.last_text() and "Время начала" in env.session.last_text()
+
+
+# ---------- передача брони ----------
+
+async def test_transfer_booking_to_another_master(cal_env):
+    env = cal_env
+    env.db.add_master(555, "Оля")
+    await book(env, MASHA, "2 ч", "10:00", "Свечи")
+    b = env.db.list_active(0, 2**40)[0]
+    await env.msg(MASHA, "/my")
+    await env.click_text(MASHA, f"Передать #{b.id}")
+    names = list(env.session.buttons())
+    assert "Даша" in names and "Оля" in names and "Маша" not in names and "Не передавать" in names
+    env.db.mark_reminder(b.id, "m1440:dm")  # напоминание Маше уже ушло
+    await env.click_text(MASHA, "Даша")
+    assert "передана" in env.session.last_text()
+    after = env.db.get_booking(b.id)
+    assert (after.master_tg_id, after.master_name) == (DASHA.id, "Даша")
+    assert not env.db.reminder_sent(b.id, "m1440:dm")  # новому мастеру напомним заново
+    group = [c.text for c in env.session.sent() if c.chat_id == GROUP.id][-1]
+    assert "Бронь передана" in group and "Маша" in group and "Даша" in group and "(Маша)" not in group
+    assert "Тебе передали бронь" in [c.text for c in env.session.sent() if c.chat_id == DASHA.id][-1]
+    assert env.svc.gcal.events[0].summary == "МК: Свечи — Даша"
+    await env.msg(DASHA, "/my")
+    assert f"#{b.id}" in env.session.last_text()
+    await env.msg(MASHA, "/my")
+    assert "нет активных" in env.session.last_text()
+
+
+async def test_transfer_permissions_and_admin(env):
+    await book(env, MASHA, "1 ч", "12:00")
+    b = env.db.list_active(0, 2**40)[0]
+    await env.click(DASHA, TransferCb(booking_id=b.id).pack())  # чужую передать нельзя
+    assert "не твоя" in last_alert(env)
+    await env.msg(ADMIN, "/all")
+    await env.click_text(ADMIN, f"Передать #{b.id}")
+    await env.click_text(ADMIN, "Даша")
+    assert env.db.get_booking(b.id).master_tg_id == DASHA.id
+    to_masha = [c.text for c in env.session.sent() if c.chat_id == MASHA.id][-1]
+    assert "передал(а) твою бронь" in to_masha and "Admin" in to_masha
+    assert "(Admin)" in [c.text for c in env.session.sent() if c.chat_id == GROUP.id][-1]
+    await env.msg(DASHA, "/my")
+    await env.click_text(DASHA, f"Передать #{b.id}")
+    await env.click_text(DASHA, "Не передавать")
+    assert "остаётся" in env.session.last_text() and env.db.get_booking(b.id).master_tg_id == DASHA.id
+
+
+async def test_transfer_with_no_other_masters(env):
+    env.db.remove_master(DASHA.id)
+    await book(env, MASHA, "1 ч", "12:00")
+    b = env.db.list_active(0, 2**40)[0]
+    await env.click(MASHA, TransferCb(booking_id=b.id).pack())
+    assert "некому" in last_alert(env)
+
+
+# ---------- событие из календаря становится бронью ----------
+
+async def test_adopt_calendar_event(cal_env):
+    env = cal_env
+    env.svc.gcal.events.append(CalEvent("manual1", _tomorrow_ts(18), _tomorrow_ts(20), "Аренда"))
+    await env.msg(ADMIN, "/all")
+    await env.click_text(ADMIN, "Назначить мастера: Аренда")
+    assert "Кого назначить" in env.session.last_text() and "Аренда" in env.session.last_text()
+    await env.click_text(ADMIN, "Даша")
+    assert "Назначено" in env.session.last_text()
+    b = env.db.list_active(0, 2**40)[0]
+    assert (b.master_tg_id, b.title, b.start_ts, b.end_ts) == (DASHA.id, "Аренда", _tomorrow_ts(18), _tomorrow_ts(20))
+    assert b.gcal_event_id == "manual1"
+    assert await env.svc.external_events(0, 2**40) == []  # больше не «ручное»
+    assert env.svc.gcal.events[0].summary == "МК: Аренда — Даша"
+    assert "На тебя записан" in [c.text for c in env.session.sent() if c.chat_id == DASHA.id][-1]
+    await env.msg(MASHA, "/week")
+    assert "📌" not in env.session.last_text() and "Даша" in env.session.last_text()
+    # теперь это обычная бронь: Даша отменяет через /my, событие уходит из календаря
+    await env.msg(DASHA, "/my")
+    await env.click_text(DASHA, f"Отменить #{b.id}")
+    await env.click_text(DASHA, "Да, отменить")
+    assert not env.db.get_booking(b.id).active and env.svc.gcal.events == []
+
+
+async def test_adopt_rejects_conflicts_and_long_events(cal_env):
+    env = cal_env
+    await book(env, MASHA, "2 ч", "10:00")
+    env.svc.gcal.events.append(CalEvent("overlap", _tomorrow_ts(11), _tomorrow_ts(12), "Пересечение"))
+    d0 = _tomorrow_ts(0)
+    env.svc.gcal.events.append(CalEvent("long", d0, d0 + 2 * 86400, "Два дня"))
+    await env.msg(ADMIN, "/all")
+    await env.click_text(ADMIN, "Назначить мастера: Пересечение")
+    await env.click_text(ADMIN, "Даша")
+    assert "пересекается" in env.session.last_text()
+    await env.msg(ADMIN, "/all")
+    await env.click_text(ADMIN, "Назначить мастера: Два дня")
+    await env.click_text(ADMIN, "Даша")
+    assert "длиннее суток" in env.session.last_text()
+    assert len(env.db.list_active(0, 2**40)) == 1
+    await env.click(MASHA, AdoptCb(key="0123456789").pack())  # не админ
+    assert "Недоступно" in last_alert(env)
+
+
+async def test_manual_for_masters(env):
+    await env.msg(ADMIN, "/manual", chat=GROUP)
+    text = env.session.last_text()
+    assert "/book" in text and "/my" in text and "Передать" in text and "перерыв 30 мин" in text and "За 24 ч и за 1 ч" in text
+    await env.msg(MASHA, "/manual")
+    assert "Не понял" in env.session.last_text()

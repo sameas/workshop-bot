@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ log = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 HTTP_TIMEOUT = 10  # сек; дефолтные 60 у googleapiclient мастер на кнопке ждать не будет
 QUOTA_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}  # тоже 403, но не ошибка настройки
+NO_TITLE = "(без названия)"
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,11 @@ class CalEvent:
     start_ts: int
     end_ts: int
     summary: str
+
+    @property
+    def key(self) -> str:
+        # для callback-кнопок: id события бывает длиннее лимита в 64 байта
+        return hashlib.sha1(self.id.encode()).hexdigest()[:10]
 
 
 class CalendarUnavailable(Exception):
@@ -61,6 +68,9 @@ class NullCalendar:
         return None
 
     async def delete_event(self, event_id: str) -> None:
+        return None
+
+    async def update_event(self, event_id: str, booking: Booking) -> None:
         return None
 
     async def list_events(self, start_ts: int, end_ts: int) -> list[CalEvent]:
@@ -127,6 +137,13 @@ class GoogleCalendar:
                 return
             raise
 
+    def _update(self, event_id: str, b: Booking) -> None:
+        # только название и описание: время не меняется, а у усыновлённого события своё
+        body = self._event_body(b)
+        body = {"summary": body["summary"], "description": body["description"]}
+        with self._lock:
+            self._svc.events().patch(calendarId=self._cal, eventId=event_id, body=body).execute(num_retries=1)
+
     # ---- чтение ----
 
     def _parse_edge(self, edge: dict) -> int:
@@ -156,7 +173,7 @@ class GoogleCalendar:
                     id=ev["id"],
                     start_ts=self._parse_edge(ev["start"]),
                     end_ts=self._parse_edge(ev["end"]),
-                    summary=ev.get("summary") or "(без названия)",
+                    summary=ev.get("summary") or NO_TITLE,
                 ))
             page = res.get("nextPageToken")
             if not page or limit:
@@ -207,6 +224,9 @@ class GoogleCalendar:
 
     async def delete_event(self, event_id: str) -> None:
         await asyncio.to_thread(self._delete, event_id)
+
+    async def update_event(self, event_id: str, booking: Booking) -> None:
+        await asyncio.to_thread(self._update, event_id, booking)
 
     async def list_events(self, start_ts: int, end_ts: int) -> list[CalEvent]:
         return await asyncio.to_thread(self._list, start_ts, end_ts)

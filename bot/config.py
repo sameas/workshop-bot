@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 MAX_DURATION_MINUTES = 24 * 60
 MIN_DURATION_MINUTES = 15
+TITLE_MAX = 100                  # длина названия МК
 
 
 class ConfigError(RuntimeError):

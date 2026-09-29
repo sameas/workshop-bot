@@ -168,6 +168,11 @@ class Database:
         )
         return self.get_booking(booking_id) if cur.rowcount else None
 
+    def set_master(self, booking_id: int, tg_id: int, name: str) -> None:
+        self.conn.execute("UPDATE bookings SET master_tg_id = ?, master_name = ? WHERE id = ?", (tg_id, name, booking_id))
+        # личные напоминания заново, уже новому мастеру; в чат повторно не нужно
+        self.conn.execute("DELETE FROM reminders_sent WHERE booking_id = ? AND kind LIKE '%:dm'", (booking_id,))
+
     def list_active(self, from_ts: int, to_ts: int) -> list[Booking]:
         """Активные брони, пересекающие [from_ts, to_ts)."""
         rows = self.conn.execute(
